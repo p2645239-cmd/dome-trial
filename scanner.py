@@ -141,18 +141,38 @@ def get_polymarket_prices(dome: DomeClient, token_ids: List[str]) -> Optional[Pl
 
 def get_kalshi_prices(dome: DomeClient, market_ticker: str) -> Optional[PlatformPrices]:
     """
-    Get actual Yes and No prices from Kalshi.
-    Kalshi API returns both sides independently.
+    Get actual Yes and No prices from Kalshi — direct API call to avoid any
+    Dome SDK mapping issues.
+
+    Kalshi API returns yes_bid/yes_ask/no_bid/no_ask in cents (1-99).
+    We use the ask prices (what you'd actually pay to buy).
     """
     try:
-        result = dome.kalshi.markets.get_market_price({"market_ticker": market_ticker})
-        yes_price = result.yes.price
-        no_price = result.no.price
-        # Normalise cent-based (0-100) to decimal (0-1) if needed
-        if yes_price > 1:
-            yes_price = yes_price / 100.0
-        if no_price > 1:
-            no_price = no_price / 100.0
+        # Hit Kalshi directly for reliable yes/no prices
+        resp = httpx.get(
+            f"https://api.elections.kalshi.com/trade-api/v2/markets/{market_ticker}",
+            timeout=10,
+        )
+        resp.raise_for_status()
+        m = resp.json().get("market", {})
+
+        yes_ask = m.get("yes_ask")
+        no_ask = m.get("no_ask")
+
+        if yes_ask is None or no_ask is None:
+            # Fallback to Dome if direct API fails
+            result = dome.kalshi.markets.get_market_price({"market_ticker": market_ticker})
+            yes_price = result.yes.price
+            no_price = result.no.price
+            if yes_price > 1:
+                yes_price = yes_price / 100.0
+            if no_price > 1:
+                no_price = no_price / 100.0
+            return PlatformPrices(yes=yes_price, no=no_price, platform="KALSHI")
+
+        # Convert cents to decimal
+        yes_price = yes_ask / 100.0
+        no_price = no_ask / 100.0
         return PlatformPrices(yes=yes_price, no=no_price, platform="KALSHI")
     except Exception as e:
         console.print(f"    [dim]⚠ Kalshi price error: {e}[/]")
