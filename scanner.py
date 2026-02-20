@@ -19,6 +19,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Dict, List, Optional, Tuple
 
+import httpx
 from dotenv import load_dotenv
 from dome_api_sdk import DomeClient
 from rich.console import Console
@@ -131,87 +132,80 @@ def get_kalshi_prices(dome: DomeClient, market_ticker: str) -> Optional[Platform
         return None
 
 
-def get_polymarket_orderbook_depth(dome: DomeClient, token_id: str, side: str) -> Optional[OrderbookDepth]:
+def get_polymarket_live_book(token_id: str, side: str, target_price: float) -> Optional[OrderbookDepth]:
     """
-    Get the best price + available volume from the Polymarket orderbook.
-    side: 'buy' (look at asks — cheapest offer) or 'sell' (look at bids — best bid).
-    Tries progressively wider time windows to find a snapshot.
+    Hit the Polymarket CLOB directly for the LIVE orderbook.
+    side: 'buy' → sum asks at or below target_price
+          'sell' → sum bids at or above target_price
+    Returns shares available at (or better than) the target price.
     """
-    now_ms = int(time.time() * 1000)
-    # Try 5min, 30min, 2hr windows — snapshots may be sparse
-    windows = [5 * 60_000, 30 * 60_000, 2 * 3600_000]
+    try:
+        resp = httpx.get(
+            f"https://clob.polymarket.com/book",
+            params={"token_id": token_id},
+            timeout=10,
+        )
+        resp.raise_for_status()
+        book = resp.json()
 
-    for window in windows:
-        try:
-            result = dome.polymarket.markets.get_orderbooks({
-                "token_id": token_id,
-                "start_time": now_ms - window,
-                "end_time": now_ms,
-                "limit": 1,
-            })
-            if result.snapshots:
-                snapshot = result.snapshots[-1]
-                book = snapshot.asks if side == "buy" else snapshot.bids
+        if side == "buy":
+            # We want to buy — look at asks (offers to sell to us)
+            levels = book.get("asks", [])
+            # Sum all ask volume at or below our target price
+            total = sum(
+                float(lvl["size"]) for lvl in levels
+                if float(lvl["price"]) <= target_price + 0.001  # small tolerance
+            )
+        else:
+            levels = book.get("bids", [])
+            total = sum(
+                float(lvl["size"]) for lvl in levels
+                if float(lvl["price"]) >= target_price - 0.001
+            )
 
-                if not book:
-                    return None
-
-                if side == "buy":
-                    best = min(book, key=lambda x: float(x["price"]))
-                else:
-                    best = max(book, key=lambda x: float(x["price"]))
-
-                best_price = float(best["price"])
-                total_size = sum(
-                    float(level["size"]) for level in book
-                    if float(level["price"]) == best_price
-                )
-                return OrderbookDepth(price=best_price, size=total_size)
-            rate_limit()
-        except Exception as e:
-            console.print(f"    [dim]⚠ Poly orderbook error ({window // 60_000}m window): {e}[/]")
-            rate_limit()
-
-    return None
+        if total > 0:
+            return OrderbookDepth(price=target_price, size=total)
+        return None
+    except Exception as e:
+        console.print(f"    [dim]⚠ Poly live book error: {e}[/]")
+        return None
 
 
-def get_kalshi_orderbook_depth(dome: DomeClient, ticker: str, side: str) -> Optional[OrderbookDepth]:
+def get_kalshi_live_book(ticker: str, side: str, target_price: float) -> Optional[OrderbookDepth]:
     """
-    Get the best price + available volume from the Kalshi orderbook.
+    Hit the Kalshi API directly for the LIVE orderbook.
     side: 'yes' or 'no' — which side we want to buy.
-    Tries progressively wider time windows to find a snapshot.
+    target_price: in decimal (0-1). Kalshi book is in cents (1-99).
+    Returns contracts available at (or better than) the target price.
     """
-    now_ms = int(time.time() * 1000)
-    windows = [5 * 60_000, 30 * 60_000, 2 * 3600_000]
+    try:
+        resp = httpx.get(
+            f"https://api.elections.kalshi.com/trade-api/v2/markets/{ticker}/orderbook",
+            timeout=10,
+        )
+        resp.raise_for_status()
+        book = resp.json().get("orderbook", {})
 
-    for window in windows:
-        try:
-            result = dome.kalshi.orderbooks.get_orderbooks({
-                "ticker": ticker,
-                "start_time": now_ms - window,
-                "end_time": now_ms,
-                "limit": 1,
-            })
-            if result.snapshots:
-                snapshot = result.snapshots[-1]
-                book = snapshot.orderbook.yes if side == "yes" else snapshot.orderbook.no
+        target_cents = int(round(target_price * 100))
 
-                if not book:
-                    return None
+        if side == "yes":
+            # Buying Yes — look at yes asks (price, quantity pairs)
+            levels = book.get("yes", [])
+        else:
+            levels = book.get("no", [])
 
-                best = min(book, key=lambda x: x[0])
-                best_price = best[0]
-                if best_price > 1:
-                    best_price = best_price / 100.0
+        # Levels are [price_cents, quantity] — sum quantity at or below target
+        total = sum(
+            qty for price_cents, qty in levels
+            if price_cents <= target_cents + 1  # small tolerance
+        )
 
-                total_contracts = sum(level[1] for level in book if level[0] == best[0])
-                return OrderbookDepth(price=best_price, size=total_contracts)
-            rate_limit()
-        except Exception as e:
-            console.print(f"    [dim]⚠ Kalshi orderbook error ({window // 60_000}m window): {e}[/]")
-            rate_limit()
-
-    return None
+        if total > 0:
+            return OrderbookDepth(price=target_price, size=total)
+        return None
+    except Exception as e:
+        console.print(f"    [dim]⚠ Kalshi live book error: {e}[/]")
+        return None
 
 
 def calculate_arb(
@@ -257,79 +251,43 @@ def calculate_arb(
     return best
 
 
-def get_market_volumes(dome: DomeClient, poly_slug: str, kalshi_ticker: str) -> Tuple[Optional[float], Optional[float]]:
-    """
-    Fallback: get market-level volume when orderbook depth is unavailable.
-    Returns (poly_total_volume_usd, kalshi_24h_volume_usd).
-    """
-    poly_vol = None
-    kalshi_vol = None
-
-    try:
-        result = dome.polymarket.markets.get_markets({"market_slug": [poly_slug], "limit": 1})
-        if result.markets:
-            poly_vol = result.markets[0].volume_total
-    except Exception:
-        pass
-    rate_limit()
-
-    try:
-        result = dome.kalshi.markets.get_markets({"market_ticker": [kalshi_ticker], "limit": 1})
-        if result.markets:
-            kalshi_vol = result.markets[0].volume_24h
-    except Exception:
-        pass
-    rate_limit()
-
-    return (poly_vol, kalshi_vol)
-
-
 def get_max_arb_volume(
-    dome: DomeClient,
     strategy_key: str,
+    poly_prices: PlatformPrices,
+    kalshi_prices: PlatformPrices,
     poly_token_ids: List[str],
     kalshi_ticker: str,
-    poly_slug: str,
-) -> Tuple[Optional[float], Optional[float], Optional[float]]:
+) -> Optional[float]:
     """
-    Get the max volume (in shares/contracts) available at the arb price.
-    The bottleneck is the smaller side of the two legs.
+    Get the max volume (shares/contracts) available at the arb prices.
+    Hits live orderbooks on Polymarket CLOB and Kalshi directly.
+    Bottleneck = min of both legs.
 
-    Returns: (max_shares_at_price, poly_market_vol, kalshi_market_vol)
-    - max_shares_at_price: from orderbook depth (None if unavailable)
-    - poly_market_vol: total USD volume on Polymarket market
-    - kalshi_market_vol: 24h USD volume on Kalshi market
+    Returns: max shares executable at the arb price, or None.
     """
     poly_depth = None
     kalshi_depth = None
 
-    try:
-        if strategy_key == "poly_yes_kalshi_no":
-            poly_depth = get_polymarket_orderbook_depth(dome, poly_token_ids[0], "buy")
-            rate_limit()
-            kalshi_depth = get_kalshi_orderbook_depth(dome, kalshi_ticker, "no")
-            rate_limit()
-        elif strategy_key == "poly_no_kalshi_yes":
-            if len(poly_token_ids) >= 2:
-                poly_depth = get_polymarket_orderbook_depth(dome, poly_token_ids[1], "buy")
-            rate_limit()
-            kalshi_depth = get_kalshi_orderbook_depth(dome, kalshi_ticker, "yes")
-            rate_limit()
-    except Exception as e:
-        console.print(f"    [dim]⚠ Orderbook error: {e}[/]")
+    if strategy_key == "poly_yes_kalshi_no":
+        # Leg 1: Buy Yes on Poly at poly_prices.yes
+        poly_depth = get_polymarket_live_book(poly_token_ids[0], "buy", poly_prices.yes)
+        # Leg 2: Buy No on Kalshi at kalshi_prices.no
+        kalshi_depth = get_kalshi_live_book(kalshi_ticker, "no", kalshi_prices.no)
 
-    # Calculate max shares from orderbook
+    elif strategy_key == "poly_no_kalshi_yes":
+        # Leg 1: Buy No on Poly at poly_prices.no
+        if len(poly_token_ids) >= 2 and poly_prices.no is not None:
+            poly_depth = get_polymarket_live_book(poly_token_ids[1], "buy", poly_prices.no)
+        # Leg 2: Buy Yes on Kalshi at kalshi_prices.yes
+        kalshi_depth = get_kalshi_live_book(kalshi_ticker, "yes", kalshi_prices.yes)
+
     sizes = []
     if poly_depth and poly_depth.size > 0:
         sizes.append(poly_depth.size)
     if kalshi_depth and kalshi_depth.size > 0:
         sizes.append(kalshi_depth.size)
-    max_shares = min(sizes) if sizes else None
 
-    # Always fetch market-level volume as a liquidity indicator
-    poly_vol, kalshi_vol = get_market_volumes(dome, poly_slug, kalshi_ticker)
-
-    return (max_shares, poly_vol, kalshi_vol)
+    return min(sizes) if sizes else None
 
 
 def scan_sport(dome: DomeClient, sport: str, date: str, threshold: float, verbose: bool) -> List[dict]:
@@ -396,8 +354,6 @@ def scan_sport(dome: DomeClient, sport: str, date: str, threshold: float, verbos
                 "strategy": strategy,
                 "strategy_key": strategy_key,
                 "max_shares": None,
-                "poly_vol": None,
-                "kalshi_vol": None,
             }
 
             if arb_pct > threshold:
@@ -406,19 +362,16 @@ def scan_sport(dome: DomeClient, sport: str, date: str, threshold: float, verbos
                 console.print(f"     Poly YES={poly_prices.yes:.3f}  NO={poly_prices.no}")
                 console.print(f"     Kalshi YES={kalshi_prices.yes:.3f}  NO={kalshi_prices.no:.3f}")
 
-                max_shares, poly_vol, kalshi_vol = get_max_arb_volume(
-                    dome, strategy_key, poly_data.token_ids, kalshi_ticker, poly_data.market_slug
+                max_shares = get_max_arb_volume(
+                    strategy_key, poly_prices, kalshi_prices,
+                    poly_data.token_ids, kalshi_ticker,
                 )
                 result["max_shares"] = max_shares
-                result["poly_vol"] = poly_vol
-                result["kalshi_vol"] = kalshi_vol
 
                 if max_shares is not None:
                     console.print(f"     [cyan]Max shares at arb price: {max_shares:,.0f}[/]")
-                if poly_vol is not None or kalshi_vol is not None:
-                    pv = f"${poly_vol:,.0f}" if poly_vol else "n/a"
-                    kv = f"${kalshi_vol:,.0f}" if kalshi_vol else "n/a"
-                    console.print(f"     [dim]Market volume — Poly total: {pv} | Kalshi 24h: {kv}[/]")
+                else:
+                    console.print(f"     [dim]No shares on book at this price[/]")
 
                 arbs.append(result)
             elif verbose:
@@ -469,16 +422,12 @@ def main():
         table.add_column("K.Yes", justify="right")
         table.add_column("K.No", justify="right")
         table.add_column("Shares@Price", justify="right", style="cyan")
-        table.add_column("Poly Vol", justify="right", style="dim")
-        table.add_column("K 24h Vol", justify="right", style="dim")
 
         all_arbs.sort(key=lambda x: x["arb_pct"], reverse=True)
 
         for arb in all_arbs:
             poly_no_str = f"{arb['poly_no']:.3f}" if arb['poly_no'] is not None else "n/a"
-            shares_str = f"{arb['max_shares']:,.0f}" if arb['max_shares'] is not None else "n/a"
-            pv_str = f"${arb['poly_vol']:,.0f}" if arb['poly_vol'] is not None else "n/a"
-            kv_str = f"${arb['kalshi_vol']:,.0f}" if arb['kalshi_vol'] is not None else "n/a"
+            shares_str = f"{arb['max_shares']:,.0f}" if arb['max_shares'] is not None else "—"
 
             table.add_row(
                 SPORT_NAMES.get(arb["sport"], arb["sport"]),
@@ -489,8 +438,6 @@ def main():
                 f"{arb['kalshi_yes']:.3f}",
                 f"{arb['kalshi_no']:.3f}",
                 shares_str,
-                pv_str,
-                kv_str,
             )
 
         console.print(table)
