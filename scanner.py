@@ -544,12 +544,15 @@ def scan_sport(dome: DomeClient, sport: str, date: str, threshold: float, verbos
                 "sizing": None,
             }
 
+            # Always show compact price line per event
+            poly_no_display = f"{poly_prices.no:.3f}" if poly_prices.no is not None else "n/a"
+            kalshi_inv_tag = " ↕" if kalshi_prices.inverted else ""
+            kalshi_title_short = f" ({kalshi_prices.title})" if kalshi_prices.title else ""
+
             if arb_pct > threshold:
                 console.print(f"  [green bold]✅ ARB {arb_pct:+.2f}%[/] — {event_key}")
                 console.print(f"     {strategy}")
-                poly_no_display = f"{poly_prices.no:.3f}" if poly_prices.no is not None else "n/a"
                 console.print(f"     Poly  YES={poly_prices.yes:.3f}  NO={poly_no_display}")
-                kalshi_inv_tag = " [yellow](inverted)[/]" if kalshi_prices.inverted else ""
                 console.print(f"     Kalshi YES={kalshi_prices.yes:.3f}  NO={kalshi_prices.no:.3f}{kalshi_inv_tag}")
                 if kalshi_prices.title:
                     console.print(f"     [dim]Kalshi Q: {kalshi_prices.title}[/]")
@@ -573,13 +576,13 @@ def scan_sport(dome: DomeClient, sport: str, date: str, threshold: float, verbos
                     console.print(f"     [dim]No arb at live book prices or no liquidity[/]")
 
                 arbs.append(result)
-            elif verbose:
-                colour = "yellow" if arb_pct > 0 else "dim"
+            else:
+                # Always show prices — colour by arb proximity
+                colour = "green" if arb_pct > 0 else "yellow" if arb_pct > -2 else "dim"
                 console.print(
-                    f"  [{colour}]  {arb_pct:+.2f}% — {event_key} | "
-                    f"P: Y={poly_prices.yes:.3f} N={poly_prices.no} | "
-                    f"K: Y={kalshi_prices.yes:.3f} N={kalshi_prices.no:.3f}"
-                    f"[/{colour}]"
+                    f"  [{colour}]{arb_pct:+.2f}%[/{colour}] {event_key} — "
+                    f"P: Y={poly_prices.yes:.3f} N={poly_no_display} | "
+                    f"K: Y={kalshi_prices.yes:.3f} N={kalshi_prices.no:.3f}{kalshi_inv_tag}"
                 )
 
     return arbs
