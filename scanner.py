@@ -57,7 +57,18 @@ class PlatformPrices:
 class OrderbookDepth:
     """Available volume at the best price level."""
     price: float
-    size: float  # shares available
+    size: float  # shares/contracts available at this price
+
+
+@dataclass
+class ArbSizing:
+    """How much you can actually execute on an arb."""
+    max_shares: float          # shares/contracts you can do (bottleneck of both legs)
+    poly_shares: float         # shares available on Poly leg
+    kalshi_contracts: float    # contracts available on Kalshi leg
+    cost_per_share: float      # total cost per share across both legs (< 1.0 = arb)
+    max_outlay: float          # total $ to place both legs
+    max_profit: float          # guaranteed $ profit if executed
 
 
 def get_client() -> DomeClient:
@@ -137,7 +148,8 @@ def get_polymarket_live_book(token_id: str, side: str, target_price: float) -> O
     Hit the Polymarket CLOB directly for the LIVE orderbook.
     side: 'buy' → sum asks at or below target_price
           'sell' → sum bids at or above target_price
-    Returns shares available at (or better than) the target price.
+    Returns NORMALIZED shares (÷1M) available at (or better than) the target price.
+    Polymarket CLOB "size" is already in normalized units (1 share = $1 payout).
     """
     try:
         resp = httpx.get(
@@ -149,12 +161,10 @@ def get_polymarket_live_book(token_id: str, side: str, target_price: float) -> O
         book = resp.json()
 
         if side == "buy":
-            # We want to buy — look at asks (offers to sell to us)
             levels = book.get("asks", [])
-            # Sum all ask volume at or below our target price
             total = sum(
                 float(lvl["size"]) for lvl in levels
-                if float(lvl["price"]) <= target_price + 0.001  # small tolerance
+                if float(lvl["price"]) <= target_price + 0.001
             )
         else:
             levels = book.get("bids", [])
@@ -251,43 +261,70 @@ def calculate_arb(
     return best
 
 
-def get_max_arb_volume(
+def get_arb_sizing(
     strategy_key: str,
     poly_prices: PlatformPrices,
     kalshi_prices: PlatformPrices,
     poly_token_ids: List[str],
     kalshi_ticker: str,
-) -> Optional[float]:
+) -> Optional[ArbSizing]:
     """
-    Get the max volume (shares/contracts) available at the arb prices.
+    Get full arb sizing: shares available, $ outlay, and $ profit.
     Hits live orderbooks on Polymarket CLOB and Kalshi directly.
-    Bottleneck = min of both legs.
 
-    Returns: max shares executable at the arb price, or None.
+    Both platforms pay $1 per share/contract on win, so:
+    - cost_per_share = price_leg1 + price_leg2
+    - max_shares = min(poly_available, kalshi_available)
+    - max_outlay = max_shares × cost_per_share
+    - max_profit = max_shares × (1.0 - cost_per_share)
     """
     poly_depth = None
     kalshi_depth = None
+    poly_price = 0.0
+    kalshi_price = 0.0
 
     if strategy_key == "poly_yes_kalshi_no":
-        # Leg 1: Buy Yes on Poly at poly_prices.yes
-        poly_depth = get_polymarket_live_book(poly_token_ids[0], "buy", poly_prices.yes)
-        # Leg 2: Buy No on Kalshi at kalshi_prices.no
-        kalshi_depth = get_kalshi_live_book(kalshi_ticker, "no", kalshi_prices.no)
+        poly_price = poly_prices.yes
+        kalshi_price = kalshi_prices.no
+        poly_depth = get_polymarket_live_book(poly_token_ids[0], "buy", poly_price)
+        kalshi_depth = get_kalshi_live_book(kalshi_ticker, "no", kalshi_price)
 
     elif strategy_key == "poly_no_kalshi_yes":
-        # Leg 1: Buy No on Poly at poly_prices.no
+        poly_price = poly_prices.no if poly_prices.no is not None else 0
+        kalshi_price = kalshi_prices.yes
         if len(poly_token_ids) >= 2 and poly_prices.no is not None:
-            poly_depth = get_polymarket_live_book(poly_token_ids[1], "buy", poly_prices.no)
-        # Leg 2: Buy Yes on Kalshi at kalshi_prices.yes
-        kalshi_depth = get_kalshi_live_book(kalshi_ticker, "yes", kalshi_prices.yes)
+            poly_depth = get_polymarket_live_book(poly_token_ids[1], "buy", poly_price)
+        kalshi_depth = get_kalshi_live_book(kalshi_ticker, "yes", kalshi_price)
 
-    sizes = []
-    if poly_depth and poly_depth.size > 0:
-        sizes.append(poly_depth.size)
-    if kalshi_depth and kalshi_depth.size > 0:
-        sizes.append(kalshi_depth.size)
+    poly_avail = poly_depth.size if poly_depth else 0
+    kalshi_avail = kalshi_depth.size if kalshi_depth else 0
 
-    return min(sizes) if sizes else None
+    if poly_avail <= 0 and kalshi_avail <= 0:
+        return None
+
+    cost_per_share = poly_price + kalshi_price
+    if cost_per_share >= 1.0:
+        return None  # no arb
+
+    # Bottleneck = min of both legs (need to fill both sides)
+    if poly_avail > 0 and kalshi_avail > 0:
+        max_shares = min(poly_avail, kalshi_avail)
+    elif poly_avail > 0:
+        max_shares = poly_avail  # only one side available
+    else:
+        max_shares = kalshi_avail
+
+    max_outlay = max_shares * cost_per_share
+    max_profit = max_shares * (1.0 - cost_per_share)
+
+    return ArbSizing(
+        max_shares=max_shares,
+        poly_shares=poly_avail,
+        kalshi_contracts=kalshi_avail,
+        cost_per_share=cost_per_share,
+        max_outlay=max_outlay,
+        max_profit=max_profit,
+    )
 
 
 def scan_sport(dome: DomeClient, sport: str, date: str, threshold: float, verbose: bool) -> List[dict]:
@@ -353,25 +390,28 @@ def scan_sport(dome: DomeClient, sport: str, date: str, threshold: float, verbos
                 "arb_pct": arb_pct,
                 "strategy": strategy,
                 "strategy_key": strategy_key,
-                "max_shares": None,
+                "sizing": None,
             }
 
             if arb_pct > threshold:
                 console.print(f"  [green bold]✅ ARB {arb_pct:+.2f}%[/] — {event_key}")
                 console.print(f"     {strategy}")
-                console.print(f"     Poly YES={poly_prices.yes:.3f}  NO={poly_prices.no}")
+                poly_no_display = f"{poly_prices.no:.3f}" if poly_prices.no is not None else "n/a"
+                console.print(f"     Poly  YES={poly_prices.yes:.3f}  NO={poly_no_display}")
                 console.print(f"     Kalshi YES={kalshi_prices.yes:.3f}  NO={kalshi_prices.no:.3f}")
 
-                max_shares = get_max_arb_volume(
+                sizing = get_arb_sizing(
                     strategy_key, poly_prices, kalshi_prices,
                     poly_data.token_ids, kalshi_ticker,
                 )
-                result["max_shares"] = max_shares
+                result["sizing"] = sizing
 
-                if max_shares is not None:
-                    console.print(f"     [cyan]Max shares at arb price: {max_shares:,.0f}[/]")
+                if sizing:
+                    console.print(f"     [cyan]Book depth — Poly: {sizing.poly_shares:,.1f} shares | Kalshi: {sizing.kalshi_contracts:,.0f} contracts[/]")
+                    console.print(f"     [cyan]Max executable: {sizing.max_shares:,.1f} shares @ ${sizing.cost_per_share:.4f}/share[/]")
+                    console.print(f"     [green bold]💰 Max outlay: ${sizing.max_outlay:,.2f} → Profit: ${sizing.max_profit:,.2f}[/]")
                 else:
-                    console.print(f"     [dim]No shares on book at this price[/]")
+                    console.print(f"     [dim]No liquidity on book at these prices[/]")
 
                 arbs.append(result)
             elif verbose:
@@ -415,19 +455,29 @@ def main():
     if all_arbs:
         table = Table(title=f"🚨 Arb Opportunities > {args.threshold}%", box=box.ROUNDED)
         table.add_column("Sport", style="cyan")
-        table.add_column("Event", style="white", max_width=28)
+        table.add_column("Event", style="white", max_width=25)
         table.add_column("Arb %", style="green bold", justify="right")
         table.add_column("P.Yes", justify="right")
         table.add_column("P.No", justify="right")
         table.add_column("K.Yes", justify="right")
         table.add_column("K.No", justify="right")
-        table.add_column("Shares@Price", justify="right", style="cyan")
+        table.add_column("Max Shares", justify="right", style="cyan")
+        table.add_column("Max Outlay", justify="right")
+        table.add_column("Profit $", justify="right", style="green bold")
 
         all_arbs.sort(key=lambda x: x["arb_pct"], reverse=True)
 
         for arb in all_arbs:
             poly_no_str = f"{arb['poly_no']:.3f}" if arb['poly_no'] is not None else "n/a"
-            shares_str = f"{arb['max_shares']:,.0f}" if arb['max_shares'] is not None else "—"
+            s = arb["sizing"]
+            if s:
+                shares_str = f"{s.max_shares:,.1f}"
+                outlay_str = f"${s.max_outlay:,.2f}"
+                profit_str = f"${s.max_profit:,.2f}"
+            else:
+                shares_str = "—"
+                outlay_str = "—"
+                profit_str = "—"
 
             table.add_row(
                 SPORT_NAMES.get(arb["sport"], arb["sport"]),
@@ -438,6 +488,8 @@ def main():
                 f"{arb['kalshi_yes']:.3f}",
                 f"{arb['kalshi_no']:.3f}",
                 shares_str,
+                outlay_str,
+                profit_str,
             )
 
         console.print(table)
