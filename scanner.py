@@ -44,6 +44,17 @@ SPORT_NAMES = {
 # Rate limiting: free tier = 1 QPS
 RATE_LIMIT_DELAY = 1.1  # seconds between API calls
 
+# ---- Fee constants ----
+# Polymarket: most sports markets are FREE. Only NCAAB (cbb) and Serie A have fees.
+# fee = C × feeRate × p × (1 - p)   where C = shares, p = price
+POLY_FEE_RATE_SPORTS = 0.0175   # NCAAB / Serie A only
+POLY_FEE_RATE_DEFAULT = 0.0     # most markets: no fee
+POLY_FEE_SPORTS = {"cbb"}       # sports with Polymarket fees enabled
+
+# Kalshi: fee = ceil(0.07 × C × p × (1 - p)) in cents, i.e. per-contract
+# In dollar terms: fee_per_contract = ceil(7 × p × (1-p)) / 100
+KALSHI_FEE_RATE = 0.07  # 7% of expected earnings
+
 
 @dataclass
 class PlatformPrices:
@@ -62,13 +73,18 @@ class OrderbookDepth:
 
 @dataclass
 class ArbSizing:
-    """How much you can actually execute on an arb."""
+    """How much you can actually execute on an arb, including fees."""
     max_shares: float          # shares/contracts you can do (bottleneck of both legs)
     poly_shares: float         # shares available on Poly leg
     kalshi_contracts: float    # contracts available on Kalshi leg
     cost_per_share: float      # total cost per share across both legs (< 1.0 = arb)
-    max_outlay: float          # total $ to place both legs
-    max_profit: float          # guaranteed $ profit if executed
+    max_outlay: float          # total $ to place both legs (before fees)
+    poly_fees: float           # Polymarket fees $
+    kalshi_fees: float         # Kalshi fees $
+    total_fees: float          # combined fees $
+    gross_profit: float        # profit before fees $
+    net_profit: float          # profit after fees $
+    net_arb_pct: float         # net arb % after fees
 
 
 def get_client() -> DomeClient:
@@ -268,10 +284,35 @@ def calculate_arb(
     return best
 
 
+def calc_poly_fee(shares: float, price: float, sport: str) -> float:
+    """
+    Polymarket taker fee.
+    Most sports = FREE. NCAAB (cbb) and Serie A have fees.
+    fee = shares × feeRate × price × (1 - price)
+    """
+    if sport in POLY_FEE_SPORTS:
+        rate = POLY_FEE_RATE_SPORTS
+    else:
+        rate = POLY_FEE_RATE_DEFAULT
+    return shares * rate * price * (1.0 - price)
+
+
+def calc_kalshi_fee(contracts: float, price: float) -> float:
+    """
+    Kalshi taker fee per contract, then × contracts.
+    fee_per_contract = ceil(7 × p × (1-p)) cents → dollars
+    Total = contracts × fee_per_contract
+    """
+    import math
+    fee_cents_per = math.ceil(7.0 * price * (1.0 - price))
+    return contracts * fee_cents_per / 100.0
+
+
 def get_arb_sizing(
     strategy_key: str,
     poly_token_ids: List[str],
     kalshi_ticker: str,
+    sport: str,
 ) -> Optional[ArbSizing]:
     """
     Get full arb sizing from LIVE orderbooks — actual executable prices, not last-trade.
@@ -309,7 +350,15 @@ def get_arb_sizing(
     # Bottleneck = min of both legs
     max_shares = min(poly_depth.size, kalshi_depth.size)
     max_outlay = max_shares * cost_per_share
-    max_profit = max_shares * (1.0 - cost_per_share)
+    gross_profit = max_shares * (1.0 - cost_per_share)
+
+    # Fees
+    poly_fees = calc_poly_fee(max_shares, poly_depth.price, sport)
+    kalshi_fees = calc_kalshi_fee(max_shares, kalshi_depth.price)
+    total_fees = poly_fees + kalshi_fees
+
+    net_profit = gross_profit - total_fees
+    net_arb_pct = (net_profit / max_outlay * 100) if max_outlay > 0 else 0
 
     return ArbSizing(
         max_shares=max_shares,
@@ -317,7 +366,12 @@ def get_arb_sizing(
         kalshi_contracts=kalshi_depth.size,
         cost_per_share=cost_per_share,
         max_outlay=max_outlay,
-        max_profit=max_profit,
+        poly_fees=poly_fees,
+        kalshi_fees=kalshi_fees,
+        total_fees=total_fees,
+        gross_profit=gross_profit,
+        net_profit=net_profit,
+        net_arb_pct=net_arb_pct,
     )
 
 
@@ -395,14 +449,18 @@ def scan_sport(dome: DomeClient, sport: str, date: str, threshold: float, verbos
                 console.print(f"     Kalshi YES={kalshi_prices.yes:.3f}  NO={kalshi_prices.no:.3f}")
 
                 sizing = get_arb_sizing(
-                    strategy_key, poly_data.token_ids, kalshi_ticker,
+                    strategy_key, poly_data.token_ids, kalshi_ticker, sport,
                 )
                 result["sizing"] = sizing
 
                 if sizing:
                     console.print(f"     [cyan]Book depth — Poly: {sizing.poly_shares:,.1f} shares | Kalshi: {sizing.kalshi_contracts:,.0f} contracts[/]")
                     console.print(f"     [cyan]Max executable: {sizing.max_shares:,.1f} shares @ ${sizing.cost_per_share:.4f}/share[/]")
-                    console.print(f"     [green bold]💰 Max outlay: ${sizing.max_outlay:,.2f} → Profit: ${sizing.max_profit:,.2f}[/]")
+                    console.print(f"     Fees — Poly: ${sizing.poly_fees:,.2f} | Kalshi: ${sizing.kalshi_fees:,.2f} | Total: ${sizing.total_fees:,.2f}")
+                    if sizing.net_profit > 0:
+                        console.print(f"     [green bold]💰 Outlay: ${sizing.max_outlay:,.2f} → Net profit: ${sizing.net_profit:,.2f} ({sizing.net_arb_pct:+.2f}% after fees)[/]")
+                    else:
+                        console.print(f"     [red]❌ Fees eat the arb: ${sizing.net_profit:,.2f} net ({sizing.net_arb_pct:+.2f}% after fees)[/]")
                 else:
                     console.print(f"     [dim]No liquidity on book at these prices[/]")
 
@@ -449,16 +507,18 @@ def main():
         table = Table(title=f"🚨 Arb Opportunities > {args.threshold}%", box=box.ROUNDED)
         table.add_column("Sport", style="cyan")
         table.add_column("Event", style="white", max_width=25)
-        table.add_column("Arb %", style="green bold", justify="right")
+        table.add_column("Gross %", style="yellow", justify="right")
         table.add_column("P.Yes", justify="right")
         table.add_column("P.No", justify="right")
         table.add_column("K.Yes", justify="right")
         table.add_column("K.No", justify="right")
-        table.add_column("Max Shares", justify="right", style="cyan")
-        table.add_column("Max Outlay", justify="right")
-        table.add_column("Profit $", justify="right", style="green bold")
+        table.add_column("Shares", justify="right", style="cyan")
+        table.add_column("Outlay", justify="right")
+        table.add_column("Fees", justify="right", style="red")
+        table.add_column("Net $", justify="right", style="green bold")
+        table.add_column("Net %", justify="right", style="green bold")
 
-        all_arbs.sort(key=lambda x: x["arb_pct"], reverse=True)
+        all_arbs.sort(key=lambda x: (x["sizing"].net_profit if x["sizing"] else -9999), reverse=True)
 
         for arb in all_arbs:
             poly_no_str = f"{arb['poly_no']:.3f}" if arb['poly_no'] is not None else "n/a"
@@ -466,11 +526,16 @@ def main():
             if s:
                 shares_str = f"{s.max_shares:,.1f}"
                 outlay_str = f"${s.max_outlay:,.2f}"
-                profit_str = f"${s.max_profit:,.2f}"
+                fees_str = f"${s.total_fees:,.2f}"
+                net_str = f"${s.net_profit:,.2f}"
+                net_pct_str = f"{s.net_arb_pct:+.2f}%"
+                net_style = "green bold" if s.net_profit > 0 else "red"
             else:
                 shares_str = "—"
                 outlay_str = "—"
-                profit_str = "—"
+                fees_str = "—"
+                net_str = "—"
+                net_pct_str = "—"
 
             table.add_row(
                 SPORT_NAMES.get(arb["sport"], arb["sport"]),
@@ -482,7 +547,9 @@ def main():
                 f"{arb['kalshi_no']:.3f}",
                 shares_str,
                 outlay_str,
-                profit_str,
+                fees_str,
+                net_str,
+                net_pct_str,
             )
 
         console.print(table)
