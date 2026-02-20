@@ -62,6 +62,8 @@ class PlatformPrices:
     yes: float
     no: float
     platform: str
+    title: str = ""       # market title for alignment verification
+    inverted: bool = False # True if we detected & swapped yes/no to align with Poly
 
 
 @dataclass
@@ -146,6 +148,7 @@ def get_kalshi_prices(dome: DomeClient, market_ticker: str) -> Optional[Platform
 
     Kalshi API returns yes_bid/yes_ask/no_bid/no_ask in cents (1-99).
     We use the ask prices (what you'd actually pay to buy).
+    Also grabs the market title for polarity alignment checking.
     """
     try:
         # Hit Kalshi directly for reliable yes/no prices
@@ -156,6 +159,7 @@ def get_kalshi_prices(dome: DomeClient, market_ticker: str) -> Optional[Platform
         resp.raise_for_status()
         m = resp.json().get("market", {})
 
+        title = m.get("title", "")
         yes_ask = m.get("yes_ask")
         no_ask = m.get("no_ask")
 
@@ -168,12 +172,12 @@ def get_kalshi_prices(dome: DomeClient, market_ticker: str) -> Optional[Platform
                 yes_price = yes_price / 100.0
             if no_price > 1:
                 no_price = no_price / 100.0
-            return PlatformPrices(yes=yes_price, no=no_price, platform="KALSHI")
+            return PlatformPrices(yes=yes_price, no=no_price, platform="KALSHI", title=title)
 
         # Convert cents to decimal
         yes_price = yes_ask / 100.0
         no_price = no_ask / 100.0
-        return PlatformPrices(yes=yes_price, no=no_price, platform="KALSHI")
+        return PlatformPrices(yes=yes_price, no=no_price, platform="KALSHI", title=title)
     except Exception as e:
         console.print(f"    [dim]⚠ Kalshi price error: {e}[/]")
         return None
@@ -271,6 +275,48 @@ def get_kalshi_best_offer(ticker: str, side: str) -> Optional[OrderbookDepth]:
         return None
 
 
+def align_kalshi_to_poly(
+    poly: PlatformPrices, kalshi: PlatformPrices
+) -> PlatformPrices:
+    """
+    Detect if Kalshi's Yes/No are inverted relative to Polymarket and fix it.
+
+    Dome matches the same EVENT but the market questions can have opposite polarity.
+    e.g. Poly: "Lakers win?" (Yes=Lakers), Kalshi: "Celtics win?" (Yes=Celtics)
+
+    Heuristic: if poly.yes + kalshi.yes ≈ 1.0 (within 0.15), they're inverted.
+    When aligned, poly.yes + kalshi.yes should be far from 1.0.
+    """
+    if poly.yes is None or kalshi.yes is None:
+        return kalshi
+
+    same_side_sum = poly.yes + kalshi.yes
+    cross_side_sum = poly.yes + kalshi.no if kalshi.no is not None else None
+
+    # If same-side prices sum to ~1.0, they're inverted (opposing questions)
+    # If cross-side sums to ~1.0, they're already aligned
+    inverted = abs(same_side_sum - 1.0) < 0.15
+
+    if cross_side_sum is not None:
+        # Double-check: cross-side should be < 1.0 for aligned markets (arb space)
+        # If cross-side ≈ 1.0 and same-side ≈ 1.0, use whichever is closer
+        if abs(cross_side_sum - 1.0) < abs(same_side_sum - 1.0):
+            inverted = False  # cross-side is closer to 1.0 → already aligned
+
+    if inverted:
+        console.print(f"    [yellow]🔄 Kalshi polarity inverted — swapping Yes↔No to align with Poly[/]")
+        console.print(f"    [dim]Kalshi title: {kalshi.title}[/]")
+        return PlatformPrices(
+            yes=kalshi.no,
+            no=kalshi.yes,
+            platform="KALSHI",
+            title=kalshi.title,
+            inverted=True,
+        )
+
+    return kalshi
+
+
 def calculate_arb(
     poly: PlatformPrices, kalshi: PlatformPrices
 ) -> Tuple[float, str, str]:
@@ -343,6 +389,7 @@ def get_arb_sizing(
     poly_token_ids: List[str],
     kalshi_ticker: str,
     sport: str,
+    kalshi_inverted: bool = False,
 ) -> Optional[ArbSizing]:
     """
     Get full arb sizing from LIVE orderbooks — actual executable prices, not last-trade.
@@ -360,15 +407,17 @@ def get_arb_sizing(
     if strategy_key == "poly_yes_kalshi_no":
         # Leg 1: Buy Yes on Poly — get best ask
         poly_depth = get_polymarket_best_offer(poly_token_ids[0], "buy")
-        # Leg 2: Buy No on Kalshi — get best ask
-        kalshi_depth = get_kalshi_best_offer(kalshi_ticker, "no")
+        # Leg 2: Buy No on Kalshi — if inverted, Kalshi's actual "No" is their "Yes"
+        kalshi_book_side = "yes" if kalshi_inverted else "no"
+        kalshi_depth = get_kalshi_best_offer(kalshi_ticker, kalshi_book_side)
 
     elif strategy_key == "poly_no_kalshi_yes":
         # Leg 1: Buy No on Poly — get best ask for No token
         if len(poly_token_ids) >= 2:
             poly_depth = get_polymarket_best_offer(poly_token_ids[1], "buy")
-        # Leg 2: Buy Yes on Kalshi — get best ask
-        kalshi_depth = get_kalshi_best_offer(kalshi_ticker, "yes")
+        # Leg 2: Buy Yes on Kalshi — if inverted, Kalshi's actual "Yes" is their "No"
+        kalshi_book_side = "no" if kalshi_inverted else "yes"
+        kalshi_depth = get_kalshi_best_offer(kalshi_ticker, kalshi_book_side)
 
     if not poly_depth or not kalshi_depth:
         return None
@@ -466,11 +515,14 @@ def scan_sport(dome: DomeClient, sport: str, date: str, threshold: float, verbos
             continue
 
         for kalshi_ticker in kalshi_data.market_tickers:
-            kalshi_prices = get_kalshi_prices(dome, kalshi_ticker)
+            kalshi_prices_raw = get_kalshi_prices(dome, kalshi_ticker)
             rate_limit()
 
-            if kalshi_prices is None:
+            if kalshi_prices_raw is None:
                 continue
+
+            # Align Kalshi polarity to match Polymarket's Yes/No
+            kalshi_prices = align_kalshi_to_poly(poly_prices, kalshi_prices_raw)
 
             arb_pct, strategy, strategy_key = calculate_arb(poly_prices, kalshi_prices)
 
@@ -483,6 +535,8 @@ def scan_sport(dome: DomeClient, sport: str, date: str, threshold: float, verbos
                 "poly_no": poly_prices.no,
                 "kalshi_yes": kalshi_prices.yes,
                 "kalshi_no": kalshi_prices.no,
+                "kalshi_title": kalshi_prices.title,
+                "kalshi_inverted": kalshi_prices.inverted,
                 "arb_pct": arb_pct,
                 "strategy": strategy,
                 "strategy_key": strategy_key,
@@ -494,10 +548,14 @@ def scan_sport(dome: DomeClient, sport: str, date: str, threshold: float, verbos
                 console.print(f"     {strategy}")
                 poly_no_display = f"{poly_prices.no:.3f}" if poly_prices.no is not None else "n/a"
                 console.print(f"     Poly  YES={poly_prices.yes:.3f}  NO={poly_no_display}")
-                console.print(f"     Kalshi YES={kalshi_prices.yes:.3f}  NO={kalshi_prices.no:.3f}")
+                kalshi_inv_tag = " [yellow](inverted)[/]" if kalshi_prices.inverted else ""
+                console.print(f"     Kalshi YES={kalshi_prices.yes:.3f}  NO={kalshi_prices.no:.3f}{kalshi_inv_tag}")
+                if kalshi_prices.title:
+                    console.print(f"     [dim]Kalshi Q: {kalshi_prices.title}[/]")
 
                 sizing = get_arb_sizing(
                     strategy_key, poly_data.token_ids, kalshi_ticker, sport,
+                    kalshi_inverted=kalshi_prices.inverted,
                 )
                 result["sizing"] = sizing
 
