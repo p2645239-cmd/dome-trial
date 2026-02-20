@@ -143,13 +143,12 @@ def get_kalshi_prices(dome: DomeClient, market_ticker: str) -> Optional[Platform
         return None
 
 
-def get_polymarket_live_book(token_id: str, side: str, target_price: float) -> Optional[OrderbookDepth]:
+def get_polymarket_best_offer(token_id: str, side: str) -> Optional[OrderbookDepth]:
     """
-    Hit the Polymarket CLOB directly for the LIVE orderbook.
-    side: 'buy' → sum asks at or below target_price
-          'sell' → sum bids at or above target_price
-    Returns NORMALIZED shares (÷1M) available at (or better than) the target price.
-    Polymarket CLOB "size" is already in normalized units (1 share = $1 payout).
+    Hit the Polymarket CLOB for the LIVE orderbook.
+    side: 'buy' → best ask (cheapest you can buy at) + total size at that level
+          'sell' → best bid (highest you can sell at) + total size at that level
+    Returns the actual executable price and shares available there.
     """
     try:
         resp = httpx.get(
@@ -162,31 +161,38 @@ def get_polymarket_live_book(token_id: str, side: str, target_price: float) -> O
 
         if side == "buy":
             levels = book.get("asks", [])
+            if not levels:
+                return None
+            # Best ask = lowest price
+            best_price = min(float(lvl["price"]) for lvl in levels)
             total = sum(
                 float(lvl["size"]) for lvl in levels
-                if float(lvl["price"]) <= target_price + 0.001
+                if abs(float(lvl["price"]) - best_price) < 0.0001
             )
         else:
             levels = book.get("bids", [])
+            if not levels:
+                return None
+            # Best bid = highest price
+            best_price = max(float(lvl["price"]) for lvl in levels)
             total = sum(
                 float(lvl["size"]) for lvl in levels
-                if float(lvl["price"]) >= target_price - 0.001
+                if abs(float(lvl["price"]) - best_price) < 0.0001
             )
 
         if total > 0:
-            return OrderbookDepth(price=target_price, size=total)
+            return OrderbookDepth(price=best_price, size=total)
         return None
     except Exception as e:
         console.print(f"    [dim]⚠ Poly live book error: {e}[/]")
         return None
 
 
-def get_kalshi_live_book(ticker: str, side: str, target_price: float) -> Optional[OrderbookDepth]:
+def get_kalshi_best_offer(ticker: str, side: str) -> Optional[OrderbookDepth]:
     """
-    Hit the Kalshi API directly for the LIVE orderbook.
+    Hit the Kalshi API for the LIVE orderbook.
     side: 'yes' or 'no' — which side we want to buy.
-    target_price: in decimal (0-1). Kalshi book is in cents (1-99).
-    Returns contracts available at (or better than) the target price.
+    Returns the best ask price (in decimal 0-1) and contracts available at that level.
     """
     try:
         resp = httpx.get(
@@ -196,22 +202,23 @@ def get_kalshi_live_book(ticker: str, side: str, target_price: float) -> Optiona
         resp.raise_for_status()
         book = resp.json().get("orderbook", {})
 
-        target_cents = int(round(target_price * 100))
-
         if side == "yes":
-            # Buying Yes — look at yes asks (price, quantity pairs)
             levels = book.get("yes", [])
         else:
             levels = book.get("no", [])
 
-        # Levels are [price_cents, quantity] — sum quantity at or below target
-        total = sum(
-            qty for price_cents, qty in levels
-            if price_cents <= target_cents + 1  # small tolerance
-        )
+        if not levels:
+            return None
+
+        # Best ask = lowest price you can buy at
+        # Levels are [price_cents, quantity]
+        best_cents = min(lvl[0] for lvl in levels)
+        total = sum(lvl[1] for lvl in levels if lvl[0] == best_cents)
+
+        best_price = best_cents / 100.0
 
         if total > 0:
-            return OrderbookDepth(price=target_price, size=total)
+            return OrderbookDepth(price=best_price, size=total)
         return None
     except Exception as e:
         console.print(f"    [dim]⚠ Kalshi live book error: {e}[/]")
@@ -263,64 +270,51 @@ def calculate_arb(
 
 def get_arb_sizing(
     strategy_key: str,
-    poly_prices: PlatformPrices,
-    kalshi_prices: PlatformPrices,
     poly_token_ids: List[str],
     kalshi_ticker: str,
 ) -> Optional[ArbSizing]:
     """
-    Get full arb sizing: shares available, $ outlay, and $ profit.
-    Hits live orderbooks on Polymarket CLOB and Kalshi directly.
+    Get full arb sizing from LIVE orderbooks — actual executable prices, not last-trade.
+    Hits Polymarket CLOB + Kalshi API for the real best ask on each leg.
 
     Both platforms pay $1 per share/contract on win, so:
-    - cost_per_share = price_leg1 + price_leg2
+    - cost_per_share = best_ask_leg1 + best_ask_leg2
     - max_shares = min(poly_available, kalshi_available)
     - max_outlay = max_shares × cost_per_share
     - max_profit = max_shares × (1.0 - cost_per_share)
     """
     poly_depth = None
     kalshi_depth = None
-    poly_price = 0.0
-    kalshi_price = 0.0
 
     if strategy_key == "poly_yes_kalshi_no":
-        poly_price = poly_prices.yes
-        kalshi_price = kalshi_prices.no
-        poly_depth = get_polymarket_live_book(poly_token_ids[0], "buy", poly_price)
-        kalshi_depth = get_kalshi_live_book(kalshi_ticker, "no", kalshi_price)
+        # Leg 1: Buy Yes on Poly — get best ask
+        poly_depth = get_polymarket_best_offer(poly_token_ids[0], "buy")
+        # Leg 2: Buy No on Kalshi — get best ask
+        kalshi_depth = get_kalshi_best_offer(kalshi_ticker, "no")
 
     elif strategy_key == "poly_no_kalshi_yes":
-        poly_price = poly_prices.no if poly_prices.no is not None else 0
-        kalshi_price = kalshi_prices.yes
-        if len(poly_token_ids) >= 2 and poly_prices.no is not None:
-            poly_depth = get_polymarket_live_book(poly_token_ids[1], "buy", poly_price)
-        kalshi_depth = get_kalshi_live_book(kalshi_ticker, "yes", kalshi_price)
+        # Leg 1: Buy No on Poly — get best ask for No token
+        if len(poly_token_ids) >= 2:
+            poly_depth = get_polymarket_best_offer(poly_token_ids[1], "buy")
+        # Leg 2: Buy Yes on Kalshi — get best ask
+        kalshi_depth = get_kalshi_best_offer(kalshi_ticker, "yes")
 
-    poly_avail = poly_depth.size if poly_depth else 0
-    kalshi_avail = kalshi_depth.size if kalshi_depth else 0
-
-    if poly_avail <= 0 and kalshi_avail <= 0:
+    if not poly_depth or not kalshi_depth:
         return None
 
-    cost_per_share = poly_price + kalshi_price
+    cost_per_share = poly_depth.price + kalshi_depth.price
     if cost_per_share >= 1.0:
-        return None  # no arb
+        return None  # no arb at actual executable prices
 
-    # Bottleneck = min of both legs (need to fill both sides)
-    if poly_avail > 0 and kalshi_avail > 0:
-        max_shares = min(poly_avail, kalshi_avail)
-    elif poly_avail > 0:
-        max_shares = poly_avail  # only one side available
-    else:
-        max_shares = kalshi_avail
-
+    # Bottleneck = min of both legs
+    max_shares = min(poly_depth.size, kalshi_depth.size)
     max_outlay = max_shares * cost_per_share
     max_profit = max_shares * (1.0 - cost_per_share)
 
     return ArbSizing(
         max_shares=max_shares,
-        poly_shares=poly_avail,
-        kalshi_contracts=kalshi_avail,
+        poly_shares=poly_depth.size,
+        kalshi_contracts=kalshi_depth.size,
         cost_per_share=cost_per_share,
         max_outlay=max_outlay,
         max_profit=max_profit,
@@ -401,8 +395,7 @@ def scan_sport(dome: DomeClient, sport: str, date: str, threshold: float, verbos
                 console.print(f"     Kalshi YES={kalshi_prices.yes:.3f}  NO={kalshi_prices.no:.3f}")
 
                 sizing = get_arb_sizing(
-                    strategy_key, poly_prices, kalshi_prices,
-                    poly_data.token_ids, kalshi_ticker,
+                    strategy_key, poly_data.token_ids, kalshi_ticker,
                 )
                 result["sizing"] = sizing
 
