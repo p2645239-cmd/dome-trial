@@ -207,8 +207,16 @@ def get_polymarket_best_offer(token_id: str, side: str) -> Optional[OrderbookDep
 def get_kalshi_best_offer(ticker: str, side: str) -> Optional[OrderbookDepth]:
     """
     Hit the Kalshi API for the LIVE orderbook.
-    side: 'yes' or 'no' — which side we want to buy.
-    Returns the best ask price (in decimal 0-1) and contracts available at that level.
+    side: 'yes' or 'no' — which side we want to BUY.
+
+    Kalshi book structure:
+      yes = resting BUY orders for YES [price_cents, qty]
+      no  = resting BUY orders for NO  [price_cents, qty]
+
+    To BUY YES: take the highest NO bid → you pay (100 - no_bid) cents
+    To BUY NO:  take the highest YES bid → you pay (100 - yes_bid) cents
+
+    Volume at that price = qty at the highest opposing bid.
     """
     try:
         resp = httpx.get(
@@ -219,22 +227,24 @@ def get_kalshi_best_offer(ticker: str, side: str) -> Optional[OrderbookDepth]:
         book = resp.json().get("orderbook", {})
 
         if side == "yes":
-            levels = book.get("yes", [])
+            # To buy YES, take the best (highest) NO bid
+            opposite_bids = book.get("no", [])
         else:
-            levels = book.get("no", [])
+            # To buy NO, take the best (highest) YES bid
+            opposite_bids = book.get("yes", [])
 
-        if not levels:
+        if not opposite_bids:
             return None
 
-        # Best ask = lowest price you can buy at
-        # Levels are [price_cents, quantity]
-        best_cents = min(lvl[0] for lvl in levels)
-        total = sum(lvl[1] for lvl in levels if lvl[0] == best_cents)
+        # Highest opposing bid = cheapest price to buy our side
+        best_opposing_cents = max(lvl[0] for lvl in opposite_bids)
+        total = sum(lvl[1] for lvl in opposite_bids if lvl[0] == best_opposing_cents)
 
-        best_price = best_cents / 100.0
+        # Price we pay = 100 - opposing bid (in cents), convert to decimal
+        buy_price = (100 - best_opposing_cents) / 100.0
 
         if total > 0:
-            return OrderbookDepth(price=best_price, size=total)
+            return OrderbookDepth(price=buy_price, size=total)
         return None
     except Exception as e:
         console.print(f"    [dim]⚠ Kalshi live book error: {e}[/]")
