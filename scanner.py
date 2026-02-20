@@ -128,12 +128,13 @@ def get_polymarket_prices(dome: DomeClient, token_ids: List[str]) -> Optional[Pl
         yes_price = yes_result.price
         rate_limit()
 
+        no_price = None
         if len(token_ids) >= 2:
-            no_result = dome.polymarket.markets.get_market_price({"token_id": token_ids[1]})
-            no_price = no_result.price
-        else:
-            # Fallback only if no second token — flag it
-            no_price = None
+            try:
+                no_result = dome.polymarket.markets.get_market_price({"token_id": token_ids[1]})
+                no_price = no_result.price
+            except Exception as e:
+                console.print(f"    [dim]⚠ Poly No token price failed (continuing with Yes only): {e}[/]")
 
         return PlatformPrices(yes=yes_price, no=no_price, platform="POLYMARKET")
     except Exception as e:
