@@ -353,29 +353,47 @@ def get_arb_sizing(
     if not poly_depth or not kalshi_depth:
         return None
 
-    cost_per_share = poly_depth.price + kalshi_depth.price
-    if cost_per_share >= 1.0:
+    poly_buy_price = poly_depth.price   # what you pay per share on Poly
+    kalshi_buy_price = kalshi_depth.price  # what you pay per contract on Kalshi
+
+    cost_per_unit = poly_buy_price + kalshi_buy_price
+    if cost_per_unit >= 1.0:
         return None  # no arb at actual executable prices
 
-    # Bottleneck = min of both legs
-    max_shares = min(poly_depth.size, kalshi_depth.size)
-    max_outlay = max_shares * cost_per_share
-    gross_profit = max_shares * (1.0 - cost_per_share)
+    # Sanity: >20% arb from live book is almost certainly a data/matching error
+    if cost_per_unit < 0.5:
+        console.print(f"    [yellow]⚠ Suspicious: cost {cost_per_unit:.3f} (<$0.50) — likely wrong market match, skipping[/]")
+        return None
 
-    # Fees
-    poly_fees = calc_poly_fee(max_shares, poly_depth.price, sport)
-    kalshi_fees = calc_kalshi_fee(max_shares, kalshi_depth.price)
+    # Bottleneck = min of both legs
+    max_units = min(poly_depth.size, kalshi_depth.size)
+
+    # OUTLAY: what you spend to enter both legs
+    poly_outlay = max_units * poly_buy_price
+    kalshi_outlay = max_units * kalshi_buy_price
+    total_outlay = poly_outlay + kalshi_outlay  # = max_units × cost_per_unit
+
+    # PAYOUT: one side always wins, paying $1.00 per unit
+    guaranteed_payout = max_units * 1.0
+
+    # GROSS PROFIT: payout minus outlay
+    gross_profit = guaranteed_payout - total_outlay
+
+    # FEES
+    poly_fees = calc_poly_fee(max_units, poly_buy_price, sport)
+    kalshi_fees = calc_kalshi_fee(max_units, kalshi_buy_price)
     total_fees = poly_fees + kalshi_fees
 
+    # NET PROFIT: gross minus all fees
     net_profit = gross_profit - total_fees
-    net_arb_pct = (net_profit / max_outlay * 100) if max_outlay > 0 else 0
+    net_arb_pct = (net_profit / total_outlay * 100) if total_outlay > 0 else 0
 
     return ArbSizing(
-        max_shares=max_shares,
+        max_shares=max_units,
         poly_shares=poly_depth.size,
         kalshi_contracts=kalshi_depth.size,
-        cost_per_share=cost_per_share,
-        max_outlay=max_outlay,
+        cost_per_share=cost_per_unit,
+        max_outlay=total_outlay,
         poly_fees=poly_fees,
         kalshi_fees=kalshi_fees,
         total_fees=total_fees,
@@ -465,14 +483,15 @@ def scan_sport(dome: DomeClient, sport: str, date: str, threshold: float, verbos
 
                 if sizing:
                     console.print(f"     [cyan]Book depth — Poly: {sizing.poly_shares:,.1f} shares | Kalshi: {sizing.kalshi_contracts:,.0f} contracts[/]")
-                    console.print(f"     [cyan]Max executable: {sizing.max_shares:,.1f} shares @ ${sizing.cost_per_share:.4f}/share[/]")
+                    console.print(f"     [cyan]Max units: {sizing.max_shares:,.1f} @ cost ${sizing.cost_per_share:.4f}/unit (payout $1.00/unit)[/]")
+                    console.print(f"     Outlay: ${sizing.max_outlay:,.2f} | Payout: ${sizing.max_shares:,.2f} | Gross: ${sizing.gross_profit:,.2f}")
                     console.print(f"     Fees — Poly: ${sizing.poly_fees:,.2f} | Kalshi: ${sizing.kalshi_fees:,.2f} | Total: ${sizing.total_fees:,.2f}")
                     if sizing.net_profit > 0:
-                        console.print(f"     [green bold]💰 Outlay: ${sizing.max_outlay:,.2f} → Net profit: ${sizing.net_profit:,.2f} ({sizing.net_arb_pct:+.2f}% after fees)[/]")
+                        console.print(f"     [green bold]💰 Net profit: ${sizing.net_profit:,.2f} on ${sizing.max_outlay:,.2f} outlay ({sizing.net_arb_pct:+.2f}% return)[/]")
                     else:
                         console.print(f"     [red]❌ Fees eat the arb: ${sizing.net_profit:,.2f} net ({sizing.net_arb_pct:+.2f}% after fees)[/]")
                 else:
-                    console.print(f"     [dim]No liquidity on book at these prices[/]")
+                    console.print(f"     [dim]No arb at live book prices or no liquidity[/]")
 
                 arbs.append(result)
             elif verbose:
