@@ -515,6 +515,14 @@ def scan_sport(dome: DomeClient, sport: str, date: str, threshold: float, verbos
         if poly_prices is None:
             continue
 
+        # Check all Kalshi tickers for this event, pick the best arb
+        best_arb = -999
+        best_result = None
+        best_kalshi_prices = None
+        best_kalshi_ticker = None
+        best_strategy = None
+        best_strategy_key = None
+
         for kalshi_ticker in kalshi_data.market_tickers:
             kalshi_prices_raw = get_kalshi_prices(dome, kalshi_ticker)
             rate_limit()
@@ -527,63 +535,83 @@ def scan_sport(dome: DomeClient, sport: str, date: str, threshold: float, verbos
 
             arb_pct, strategy, strategy_key = calculate_arb(poly_prices, kalshi_prices)
 
-            result = {
-                "event": event_key,
-                "sport": sport,
-                "poly_slug": poly_data.market_slug,
-                "kalshi_ticker": kalshi_ticker,
-                "poly_yes": poly_prices.yes,
-                "poly_no": poly_prices.no,
-                "kalshi_yes": kalshi_prices.yes,
-                "kalshi_no": kalshi_prices.no,
-                "kalshi_title": kalshi_prices.title,
-                "kalshi_inverted": kalshi_prices.inverted,
-                "arb_pct": arb_pct,
-                "strategy": strategy,
-                "strategy_key": strategy_key,
-                "sizing": None,
-            }
+            if arb_pct > best_arb:
+                best_arb = arb_pct
+                best_kalshi_prices = kalshi_prices
+                best_kalshi_ticker = kalshi_ticker
+                best_strategy = strategy
+                best_strategy_key = strategy_key
 
-            # Always show compact price line per event
-            poly_no_display = f"{poly_prices.no:.3f}" if poly_prices.no is not None else "n/a"
-            kalshi_inv_tag = " ↕" if kalshi_prices.inverted else ""
-            kalshi_title_short = f" ({kalshi_prices.title})" if kalshi_prices.title else ""
+        if best_kalshi_prices is None:
+            continue
 
-            if arb_pct > threshold:
-                console.print(f"  [green bold]✅ ARB {arb_pct:+.2f}%[/] — {event_key}")
-                console.print(f"     {strategy}")
-                console.print(f"     Poly  YES={poly_prices.yes:.3f}  NO={poly_no_display}")
-                console.print(f"     Kalshi YES={kalshi_prices.yes:.3f}  NO={kalshi_prices.no:.3f}{kalshi_inv_tag}")
-                if kalshi_prices.title:
-                    console.print(f"     [dim]Kalshi Q: {kalshi_prices.title}[/]")
+        kalshi_prices = best_kalshi_prices
+        arb_pct = best_arb
 
-                sizing = get_arb_sizing(
-                    strategy_key, poly_data.token_ids, kalshi_ticker, sport,
-                    kalshi_inverted=kalshi_prices.inverted,
-                )
-                result["sizing"] = sizing
+        result = {
+            "event": event_key,
+            "sport": sport,
+            "poly_slug": poly_data.market_slug,
+            "kalshi_ticker": best_kalshi_ticker,
+            "poly_yes": poly_prices.yes,
+            "poly_no": poly_prices.no,
+            "kalshi_yes": kalshi_prices.yes,
+            "kalshi_no": kalshi_prices.no,
+            "kalshi_title": kalshi_prices.title,
+            "kalshi_inverted": kalshi_prices.inverted,
+            "arb_pct": arb_pct,
+            "strategy": best_strategy,
+            "strategy_key": best_strategy_key,
+            "sizing": None,
+        }
 
-                if sizing:
-                    console.print(f"     [cyan]Book depth — Poly: {sizing.poly_shares:,.1f} shares | Kalshi: {sizing.kalshi_contracts:,.0f} contracts[/]")
-                    console.print(f"     [cyan]Max units: {sizing.max_shares:,.1f} @ cost ${sizing.cost_per_share:.4f}/unit (payout $1.00/unit)[/]")
-                    console.print(f"     Outlay: ${sizing.max_outlay:,.2f} | Payout: ${sizing.max_shares:,.2f} | Gross: ${sizing.gross_profit:,.2f}")
-                    console.print(f"     Fees — Poly: ${sizing.poly_fees:,.2f} | Kalshi: ${sizing.kalshi_fees:,.2f} | Total: ${sizing.total_fees:,.2f}")
-                    if sizing.net_profit > 0:
-                        console.print(f"     [green bold]💰 Net profit: ${sizing.net_profit:,.2f} on ${sizing.max_outlay:,.2f} outlay ({sizing.net_arb_pct:+.2f}% return)[/]")
-                    else:
-                        console.print(f"     [red]❌ Fees eat the arb: ${sizing.net_profit:,.2f} net ({sizing.net_arb_pct:+.2f}% after fees)[/]")
+        # Always show prices
+        poly_no_display = f"{poly_prices.no:.3f}" if poly_prices.no is not None else "n/a"
+        kalshi_inv_tag = " ↕" if kalshi_prices.inverted else ""
+
+        # Colour by arb quality
+        if arb_pct > threshold:
+            colour_tag = "green bold"
+            prefix = "✅ ARB"
+        elif arb_pct > 0:
+            colour_tag = "green"
+            prefix = "  "
+        elif arb_pct > -2:
+            colour_tag = "yellow"
+            prefix = "  "
+        else:
+            colour_tag = "dim"
+            prefix = "  "
+
+        console.print(
+            f"  [{colour_tag}]{prefix} {arb_pct:+.2f}%[/{colour_tag}] {event_key} — "
+            f"P: Y={poly_prices.yes:.3f} N={poly_no_display} | "
+            f"K: Y={kalshi_prices.yes:.3f} N={kalshi_prices.no:.3f}{kalshi_inv_tag}"
+        )
+
+        # Show sizing for any positive arb (not just above threshold)
+        if arb_pct > 0:
+            console.print(f"     {best_strategy}")
+
+            sizing = get_arb_sizing(
+                best_strategy_key, poly_data.token_ids, best_kalshi_ticker, sport,
+                kalshi_inverted=kalshi_prices.inverted,
+            )
+            result["sizing"] = sizing
+
+            if sizing:
+                console.print(f"     [cyan]Book: Poly {sizing.poly_shares:,.1f} shares | Kalshi {sizing.kalshi_contracts:,.0f} contracts → Max {sizing.max_shares:,.1f} units[/]")
+                console.print(f"     [cyan]Cost ${sizing.cost_per_share:.4f}/unit → Outlay ${sizing.max_outlay:,.2f}[/]")
+                console.print(f"     Fees — Poly: ${sizing.poly_fees:,.2f} | Kalshi: ${sizing.kalshi_fees:,.2f} | Total: ${sizing.total_fees:,.2f}")
+                if sizing.net_profit > 0:
+                    console.print(f"     [green bold]💰 Net profit: ${sizing.net_profit:,.2f} on ${sizing.max_outlay:,.2f} outlay ({sizing.net_arb_pct:+.2f}% return)[/]")
                 else:
-                    console.print(f"     [dim]No arb at live book prices or no liquidity[/]")
-
-                arbs.append(result)
+                    console.print(f"     [red]❌ Fees eat the arb: ${sizing.net_profit:,.2f} net ({sizing.net_arb_pct:+.2f}% after fees)[/]")
             else:
-                # Always show prices — colour by arb proximity
-                colour = "green" if arb_pct > 0 else "yellow" if arb_pct > -2 else "dim"
-                console.print(
-                    f"  [{colour}]{arb_pct:+.2f}%[/{colour}] {event_key} — "
-                    f"P: Y={poly_prices.yes:.3f} N={poly_no_display} | "
-                    f"K: Y={kalshi_prices.yes:.3f} N={kalshi_prices.no:.3f}{kalshi_inv_tag}"
-                )
+                console.print(f"     [dim]No arb at live book prices or no liquidity[/]")
+
+        if arb_pct > threshold:
+            arbs.append(result)
 
     return arbs
 
